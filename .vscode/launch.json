@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run llm_test from root",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/llm_test.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}
