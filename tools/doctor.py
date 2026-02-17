@@ -1,7 +1,9 @@
 import os
 import sys
 import json
+import platform
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -50,10 +52,12 @@ def check_audio_devices():
         fail("Could not list avfoundation audio devices. Something is wrong with ffmpeg/permissions.")
     ok("Can list avfoundation devices")
 
-    def has_idx(idx: int) -> bool:
-        return f"[{idx}]" in text and "AVFoundation audio devices:" in text
+    # Check for BlackHole virtual audio device
+    if "BlackHole" in text:
+        ok("BlackHole virtual audio device detected")
+    else:
+        warn("BlackHole not found in device list. Install BlackHole for system audio capture.")
 
-    # crude but effective
     if f"[{SYSTEM_IDX}]" not in text:
         warn(f"SYSTEM_AUDIO_IDX={SYSTEM_IDX} not found in device list. Update env or your device order changed.")
     else:
@@ -63,6 +67,15 @@ def check_audio_devices():
         warn(f"MIC_AUDIO_IDX={MIC_IDX} not found in device list. Update env or your device order changed.")
     else:
         ok(f"Found mic audio device index {MIC_IDX}")
+
+def check_disk_space():
+    import shutil
+    usage = shutil.disk_usage(str(PROJECT_ROOT))
+    free_gb = usage.free / (1024 ** 3)
+    if free_gb < 1.0:
+        warn(f"Low disk space: {free_gb:.1f} GB free")
+    else:
+        ok(f"Disk space: {free_gb:.1f} GB free")
 
 def check_wavs_optional():
     sys_wav = DATA_DIR / "system.wav"
@@ -76,6 +89,19 @@ def check_wavs_optional():
     else:
         warn(f"Missing {mic_wav} (ok if you haven't recorded yet)")
 
+def check_apple_silicon():
+    is_arm = platform.machine() == "arm64" and platform.system() == "Darwin"
+    if is_arm:
+        ok("Apple Silicon detected (arm64)")
+        try:
+            import mlx_whisper  # noqa: F401
+            ok("mlx-whisper is installed — recommended backend for Apple Silicon")
+        except ImportError:
+            warn("mlx-whisper not installed. Install with: pip install mlx-whisper")
+            warn("MLX backend gives ~2-3x speedup on Apple Silicon vs faster-whisper")
+    else:
+        ok(f"Architecture: {platform.machine()} — using faster-whisper backend")
+
 def check_whisper_optional():
     sys_wav = DATA_DIR / "system.wav"
     mic_wav = DATA_DIR / "mic.wav"
@@ -83,33 +109,30 @@ def check_whisper_optional():
         warn("No WAVs found; skipping Whisper test.")
         return
 
+    # Use the unified Transcriber which auto-detects backend
+    sys.path.insert(0, str(PROJECT_ROOT))
     try:
-        from faster_whisper import WhisperModel
-        ok("faster-whisper import OK")
+        from app.transcribe import Transcriber
+        ok(f"Transcriber import OK")
     except Exception as e:
-        fail(f"faster-whisper not installed/import failed: {e}")
+        fail(f"Transcriber import failed: {e}")
 
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    ok("Whisper model loaded (small, cpu, int8)")
+    transcriber = Transcriber(model_name="small")
+    ok(f"Whisper model loaded (backend={transcriber.backend}, model=small)")
 
-    def transcribe(path: Path) -> str:
-        segments, info = model.transcribe(str(path), beam_size=5, vad_filter=True)
-        text = " ".join([s.text.strip() for s in segments]).strip()
-        return text
+    def transcribe_and_bench(path: Path, label: str):
+        t0 = time.time()
+        text = transcriber.transcribe_file(path)
+        elapsed = time.time() - t0
+        if text:
+            ok(f"Whisper transcript ({label}) in {elapsed:.1f}s: {text[:80]}...")
+        else:
+            warn(f"Whisper transcript for {label} is empty (maybe silent).")
 
     if sys_wav.exists():
-        t = transcribe(sys_wav)
-        if t:
-            ok(f"Whisper transcript (system.wav) looks non-empty: {t[:80]}...")
-        else:
-            warn("Whisper transcript for system.wav is empty (maybe silent routing).")
-
+        transcribe_and_bench(sys_wav, "system.wav")
     if mic_wav.exists():
-        t = transcribe(mic_wav)
-        if t:
-            ok(f"Whisper transcript (mic.wav) looks non-empty: {t[:80]}...")
-        else:
-            warn("Whisper transcript for mic.wav is empty (mic muted?).")
+        transcribe_and_bench(mic_wav, "mic.wav")
 
 def check_lmstudio():
     import requests
@@ -165,8 +188,10 @@ def check_translation_sanity():
 def main():
     print("=== meeting_local doctor ===")
     check_python()
+    check_apple_silicon()
     check_ffmpeg()
     check_audio_devices()
+    check_disk_space()
     check_wavs_optional()
     check_whisper_optional()
     check_lmstudio()

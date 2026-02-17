@@ -1,6 +1,9 @@
+import logging
 import subprocess
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 def record_chunk_avfoundation(audio_index: int, seconds: int, out_path: Path, sample_rate: int = 16000, retries: int = 3) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
