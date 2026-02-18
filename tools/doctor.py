@@ -165,7 +165,8 @@ def check_translation_sanity():
     try:
         # ensure project root on path
         sys.path.insert(0, str(PROJECT_ROOT))
-        from app.lmstudio_client import chat, LMSTUDIO_MODEL_FAST
+        from app.config import LM_MODEL_FAST
+        from app.lmstudio_client import chat
         ok("Imported app.lmstudio_client")
     except Exception as e:
         warn(f"Skipping translation sanity (import failed): {e}")
@@ -177,7 +178,7 @@ def check_translation_sanity():
         {"role": "user", "content": text_tr}
     ]
     try:
-        out = chat(os.getenv("LMSTUDIO_MODEL_FAST", LMSTUDIO_MODEL_FAST), msgs, temperature=0.0, timeout=30).strip()
+        out = chat(LM_MODEL_FAST, msgs, temperature=0.0, timeout=30).strip()
         if "\n" in out or "Option" in out or "Breakdown" in out:
             warn(f"Translation output looks verbose; tighten prompt. Output was: {out[:120]}...")
         else:
