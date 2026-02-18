@@ -7,16 +7,24 @@ Usage:
 """
 import logging
 import os
+from pathlib import Path
 
 # Enable rich UI
 os.environ.setdefault("RICH_UI", "true")
 
 from app.pipeline import Pipeline
 
+_log_dir = Path("out")
+_log_dir.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_log_dir / "meeting_local.log", encoding="utf-8"),
+    ],
 )
 
 

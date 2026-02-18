@@ -10,14 +10,22 @@ from datetime import datetime
 from pathlib import Path
 from collections import deque
 
+from app.config import CLEANUP_WAV, SKIP_EMPTY_CHUNKS, STREAM_TRANSLATION, MINUTES_WINDOW
 from app.ffmpeg_capture import record_chunk_avfoundation
 from app.transcribe import Transcriber
-from app.lmstudio_client import translate, summarize_block
+from app.lmstudio_client import translate, translate_stream, summarize_block
 from app.health import HealthMonitor
 from app.ui import create_ui
 from app.output import StructuredOutput
 
 logger = logging.getLogger(__name__)
+
+# Common Whisper hallucinations on silent/near-silent audio
+_HALLUCINATION_PATTERNS = frozenset({
+    "thank you", "thanks for watching", "thanks for listening",
+    "you", "bye", "the end", "thank you for watching",
+    "subscribe", "like and subscribe",
+})
 
 
 class Pipeline:
@@ -53,16 +61,22 @@ class Pipeline:
         self.out_dir.mkdir(exist_ok=True)
 
         self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # starts unpaused
         self._capture_queue = queue.Queue(maxsize=4)
         self._transcribe_queue = queue.Queue(maxsize=4)
 
         self._translation_buffer = deque(maxlen=1200)
+        self._buffer_seq = 0  # monotonically increasing sequence number
         self._buffer_lock = threading.Lock()
 
         self._last_summary_text = ""
 
         self._transcriber = None
         self._health = HealthMonitor()
+
+        self.on_transcript_callback = None
+        self.on_translation_callback = None
         self._meeting_start = datetime.now()
         self._ui = create_ui(meeting_start=self._meeting_start)
         self._structured_output = StructuredOutput(self.out_dir, meeting_start=self._meeting_start)
@@ -103,6 +117,12 @@ class Pipeline:
         self._init_vad()
 
         while not self._stop_event.is_set():
+            # Block here while paused
+            while not self._pause_event.is_set() and not self._stop_event.is_set():
+                self._pause_event.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                break
+
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             wav_path = self.data_dir / f"sys_{stamp}.wav"
             try:
@@ -120,12 +140,7 @@ class Pipeline:
                 continue
 
             if self.vad_enabled and self._vad:
-                # Check for speech first — skip silent chunks entirely
-                if not self._vad["has_speech"](wav_path):
-                    logger.debug("No speech detected in %s, skipping", wav_path.name)
-                    continue
-
-                # Segment based on VAD boundaries
+                # segment_audio returns [] when no speech — no need for separate has_speech() call
                 segments = self._vad["segment_audio"](
                     wav_path,
                     min_chunk_seconds=3.0,
@@ -134,7 +149,7 @@ class Pipeline:
                 )
 
                 if not segments:
-                    self._capture_queue.put(wav_path, timeout=10)
+                    logger.debug("No speech detected in %s, skipping", wav_path.name)
                     continue
 
                 for i, (start_sec, end_sec) in enumerate(segments):
@@ -157,33 +172,63 @@ class Pipeline:
             except queue.Empty:
                 continue
 
-            try:
-                text = self._transcriber.transcribe_file(wav_path)
-            except Exception as e:
-                logger.error("[TRANSCRIBE ERROR] %s", e)
-                continue
+            text = None
+            for attempt in range(3):
+                try:
+                    text = self._transcriber.transcribe_file(wav_path)
+                    self._health.on_transcribe_success()
+                    break
+                except Exception as e:
+                    action = self._health.on_transcribe_error(e)
+                    logger.error("[TRANSCRIBE ERROR] %s (action=%s, attempt=%d/3)",
+                                 e, action, attempt + 1)
+                    if action == "skip":
+                        break
+                    time.sleep(0.5)
 
             if not text:
-                logger.debug("Empty transcript for %s", wav_path.name)
+                logger.debug("Empty or failed transcript for %s", wav_path.name)
+                continue
+
+            # Filter Whisper hallucinations on silent/near-silent audio
+            if SKIP_EMPTY_CHUNKS and text.strip().lower() in _HALLUCINATION_PATTERNS:
+                logger.debug("Skipping hallucinated chunk: %r", text)
                 continue
 
             self._ui.on_transcript(text)
+            if self.on_transcript_callback:
+                self.on_transcript_callback(text)
             line = f"[{self._ts()}] [SYS] {text}"
             self._append_line(self.out_dir / "transcript.txt", line)
 
             self._transcribe_queue.put((text, self._ts()))
 
+            # Clean up WAV after successful transcription
+            if CLEANUP_WAV:
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.debug("Failed to clean up %s: %s", wav_path.name, e)
+
     def _translate_worker(self):
         logger.info("Translation thread started (target=%s)", self.target_lang)
+        MAX_TRANSLATE_RETRIES = 3
+
         while not self._stop_event.is_set():
             try:
-                text, timestamp = self._transcribe_queue.get(timeout=1)
+                item = self._transcribe_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
+            # Support retry counter in tuple
+            if len(item) == 3:
+                text, timestamp, retry_count = item
+            else:
+                text, timestamp = item
+                retry_count = 0
+
             # If LM Studio is down, skip translation (transcription-only mode)
             if self._health.is_lmstudio_down:
-                # Periodically re-check if LM Studio came back
                 from app.health import check_lmstudio_alive
                 if check_lmstudio_alive():
                     self._health.on_llm_success()
@@ -191,30 +236,41 @@ class Pipeline:
                     continue
 
             try:
-                tr = translate(text, target_lang=self.target_lang).strip()
+                if STREAM_TRANSLATION:
+                    tokens = []
+                    for token in translate_stream(text, target_lang=self.target_lang):
+                        tokens.append(token)
+                    tr = "".join(tokens).strip()
+                else:
+                    tr = translate(text, target_lang=self.target_lang).strip()
                 self._health.on_llm_success()
             except Exception as e:
                 action = self._health.on_llm_error(e)
-                logger.error("[LLM ERROR] %s (action=%s)", e, action)
-                if action == "transcribe_only":
-                    continue
-                # retry — item is already consumed, just skip this one
+                logger.error("[LLM ERROR] %s (action=%s, attempt=%d/%d)",
+                             e, action, retry_count + 1, MAX_TRANSLATE_RETRIES)
+                if action == "retry" and retry_count < MAX_TRANSLATE_RETRIES:
+                    self._transcribe_queue.put((text, timestamp, retry_count + 1))
                 continue
 
             if tr:
                 self._ui.on_translation(tr, self.target_lang)
+                if self.on_translation_callback:
+                    self.on_translation_callback(tr)
                 line_tr = f"[{self._ts()}] [SYS->{self.target_lang}] {tr}"
                 self._append_line(self.out_dir / "translation.txt", line_tr)
 
                 self._structured_output.add_entry(text, translation=tr)
 
                 with self._buffer_lock:
-                    self._translation_buffer.append(f"[{self._ts()}] {tr}")
+                    self._buffer_seq += 1
+                    self._translation_buffer.append(
+                        (self._buffer_seq, time.time(), f"[{self._ts()}] {tr}")
+                    )
 
     def _minutes_worker(self):
         logger.info("Minutes thread started (every %ds)", self.summary_every_seconds)
         last_summary_time = time.time()
-        last_buffer_idx = 0  # track how much of the buffer we've already summarized
+        last_seen_seq = 0  # track last processed sequence number (deque-eviction safe)
 
         while not self._stop_event.is_set():
             elapsed = time.time() - last_summary_time
@@ -223,10 +279,17 @@ class Pipeline:
                 continue
 
             with self._buffer_lock:
-                all_lines = list(self._translation_buffer)
+                now = time.time()
+                cutoff = now - MINUTES_WINDOW if MINUTES_WINDOW > 0 else 0
+                new_lines = [
+                    line for seq, ts, line in self._translation_buffer
+                    if seq > last_seen_seq and ts >= cutoff
+                ]
+                current_max_seq = (
+                    self._translation_buffer[-1][0]
+                    if self._translation_buffer else last_seen_seq
+                )
 
-            # Only summarize new lines since last summary
-            new_lines = all_lines[last_buffer_idx:]
             if not new_lines:
                 last_summary_time = time.time()
                 continue
@@ -239,7 +302,7 @@ class Pipeline:
             try:
                 minutes = summarize_block(block, previous_summary=self._last_summary_text)
                 self._last_summary_text = minutes
-                last_buffer_idx = len(all_lines)
+                last_seen_seq = current_max_seq
 
                 md = self.out_dir / "rolling_minutes.md"
                 txt = self.out_dir / "rolling_minutes.txt"
@@ -256,8 +319,31 @@ class Pipeline:
         logger.info("Pipeline starting: idx=%d, chunk=%ds, target=%s, summary_every=%ds, vad=%s",
                      self.system_audio_idx, self.chunk_seconds, self.target_lang,
                      self.summary_every_seconds, self.vad_enabled)
-        self._ui.on_status(f"Pipeline starting (idx={self.system_audio_idx}, chunk={self.chunk_seconds}s)")
 
+        # Preflight checks
+        preflight = self._health.run_preflight()
+        if not preflight.get("blackhole", False):
+            logger.error("PREFLIGHT FAILED: BlackHole audio device not found. "
+                         "Install BlackHole or check SYSTEM_AUDIO_IDX.")
+            raise RuntimeError("BlackHole audio device not detected")
+        if not preflight.get("lmstudio", False):
+            logger.warning("PREFLIGHT: LM Studio not reachable — starting in transcription-only mode")
+            self._health._lmstudio_was_down = True
+        if not preflight.get("disk_space", False):
+            logger.warning("PREFLIGHT: Low disk space — monitor carefully")
+
+        # Clean stale WAV files from previous sessions
+        if CLEANUP_WAV:
+            stale = list(self.data_dir.glob("sys_*.wav"))
+            if stale:
+                logger.info("Cleaning %d stale WAV files from previous session", len(stale))
+                for f in stale:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+
+        self._ui.on_status(f"Pipeline starting (idx={self.system_audio_idx}, chunk={self.chunk_seconds}s)")
         self._ui.start()
 
         threads = [
@@ -285,8 +371,44 @@ class Pipeline:
         for t in threads:
             t.join(timeout=5)
 
+        self._structured_output.flush_final()
         self._ui.stop()
         logger.info("Pipeline stopped.")
 
     def stop(self):
         self._stop_event.set()
+
+    def pause(self):
+        """Pause capture — queued items still drain through transcription/translation."""
+        self._pause_event.clear()
+        logger.info("Pipeline paused")
+
+    def resume(self):
+        """Resume capture after pause."""
+        self._pause_event.set()
+        logger.info("Pipeline resumed")
+
+    def start_background(self):
+        """Launch start() in a daemon thread so the caller (e.g. GUI mainloop) isn't blocked."""
+        t = threading.Thread(target=self.start, name="pipeline-main", daemon=True)
+        t.start()
+        return t
+
+    def reset(self):
+        """Stop pipeline and clear all state so a fresh run can begin."""
+        self.stop()
+        # Drain queues
+        for q in (self._capture_queue, self._transcribe_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        with self._buffer_lock:
+            self._translation_buffer.clear()
+            self._buffer_seq = 0
+        self._last_summary_text = ""
+        # Reset events for next run
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()

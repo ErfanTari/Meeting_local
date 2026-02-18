@@ -1,8 +1,11 @@
 """
 Structured output writers: JSON and SRT formats alongside the existing .txt/.md files.
+Batched writes to avoid rewriting full files on every entry.
 """
 import json
+import time
 import logging
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
@@ -33,26 +36,50 @@ class TranscriptEntry:
 
 
 class StructuredOutput:
-    """Manages structured output in JSON and SRT formats."""
+    """Manages structured output in JSON and SRT formats with batched writes."""
 
-    def __init__(self, out_dir: Path, meeting_start: datetime = None):
+    def __init__(self, out_dir: Path, meeting_start: datetime = None,
+                 flush_interval: float = 30.0):
         self.out_dir = out_dir
         self.meeting_start = meeting_start or datetime.now()
         self._entries: List[TranscriptEntry] = []
         self._counter = 0
+        self._flush_interval = flush_interval
+        self._dirty = False
+        self._last_flush = time.time()
+        self._lock = threading.Lock()
 
     def add_entry(self, text: str, translation: str = ""):
-        self._counter += 1
-        entry = TranscriptEntry(
-            text=text,
-            translation=translation,
-            timestamp=datetime.now(),
-            meeting_start=self.meeting_start,
-        )
-        entry._index = self._counter
-        self._entries.append(entry)
+        with self._lock:
+            self._counter += 1
+            entry = TranscriptEntry(
+                text=text,
+                translation=translation,
+                timestamp=datetime.now(),
+                meeting_start=self.meeting_start,
+            )
+            entry._index = self._counter
+            self._entries.append(entry)
+            self._dirty = True
+
+            # Flush if enough time has passed since last write
+            now = time.time()
+            if now - self._last_flush >= self._flush_interval:
+                self._flush()
+
+    def _flush(self):
+        """Write JSON and SRT to disk. Must be called with self._lock held."""
+        if not self._dirty:
+            return
         self._write_json()
         self._write_srt()
+        self._dirty = False
+        self._last_flush = time.time()
+
+    def flush_final(self):
+        """Force flush at pipeline shutdown."""
+        with self._lock:
+            self._flush()
 
     def _write_json(self):
         data = {

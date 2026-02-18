@@ -1,17 +1,11 @@
-import os
 import json
 import logging
 import requests
 from typing import List, Dict, Any, Generator
 
+from app.config import LM_URL, LM_MODEL_FAST, LM_MODEL_SMART
+
 logger = logging.getLogger(__name__)
-
-# Base URL for LM Studio OpenAI-compatible server
-LM_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1").rstrip("/")
-
-# Models (set via env vars; defaults are safe)
-LM_MODEL_FAST = os.getenv("LMSTUDIO_MODEL_FAST", "google/gemma-3-4b")
-LM_MODEL_SMART = os.getenv("LMSTUDIO_MODEL_SMART", "google/gemma-3-4b")
 
 
 def chat(model: str, messages: List[Dict[str, str]], temperature: float = 0.2, timeout: int = 120) -> str:

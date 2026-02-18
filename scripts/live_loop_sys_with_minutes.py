@@ -8,13 +8,21 @@ Usage:
 """
 import sys
 import logging
+from pathlib import Path
 from app.pipeline import Pipeline
 from app.health import HealthMonitor
+
+_log_dir = Path("out")
+_log_dir.mkdir(exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(threadName)s] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_log_dir / "meeting_local.log", encoding="utf-8"),
+    ],
 )
 
 

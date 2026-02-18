@@ -1,15 +1,14 @@
 """
 Health monitoring and automatic recovery for the meeting pipeline.
 """
-import os
 import logging
 import shutil
 import requests
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from app.config import LM_URL
 
-LM_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1").rstrip("/")
+logger = logging.getLogger(__name__)
 
 
 def check_lmstudio_alive(timeout: int = 3) -> bool:
